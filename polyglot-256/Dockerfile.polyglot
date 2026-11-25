@@ -1,0 +1,29 @@
+ARG BASE_IMAGE=quine-relay-256
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="polyglot-256" \
+      org.opencontainers.image.description="256-language polyglot programming container built from exacortex/quine-relay-256" \
+      org.opencontainers.image.source="https://github.com/exacortex/quine-relay-256" \
+      org.opencontainers.image.url="https://github.com/exacortex/quine-relay-256" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.authors="Drawn With Code (@exacortex / @rasteia)" \
+      org.opencontainers.image.vendor="Drawn With Code" \
+      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.base.name="quine-relay-256"
+
+ENV QUINE_RELAY_DIR=/usr/local/share/quine-relay \
+    PATH=/usr/local/share/quine-relay/vendor/local/bin:/usr/games:${PATH}
+
+USER root
+COPY polyglot-info /usr/local/bin/polyglot-info
+RUN chmod 755 /usr/local/bin/polyglot-info \
+    && test -d /usr/local/share/quine-relay/vendor \
+    && test -f /usr/local/share/quine-relay/LANGUAGES.md \
+    && test -f /usr/local/share/quine-relay/Makefile
+
+USER qr
+WORKDIR /usr/local/share/quine-relay
+RUN /usr/local/bin/polyglot-info --check
+
+ENTRYPOINT []
+CMD ["/bin/bash"]

@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""Inspect and verify all 256 language toolchains in Quine Relay 256.
+
+Parses LANGUAGES.md and Makefile from the Quine Relay 256 tree (default:
+$QUINE_RELAY_DIR, /usr/local/share/quine-relay, or current directory) and
+supports listing, JSON export, search, and toolchain presence checks.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import sys
+
+VERSION = "1.0.0"
+
+LANG_ROW_RE = re.compile(r"^\|\s*(\d+)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|$")
+RULE_RE = re.compile(r"^((?:QR|qr)[^:\s]*|QR2\.aj):\s*(\S+)\s*$")
+BANNER_RE = re.compile(r"##\s+(\d+):\s+(.*?)\s+->\s+(.*?)\s+##")
+ENV_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+
+SHELL_SKIP_CMDS = {
+    "rm",
+    "mv",
+    "mkdir",
+    "chmod",
+    "ulimit",
+    "cd",
+    "true",
+}
+LOCAL_BIN_RE = re.compile(r"^\./(?:QR|qr)")
+
+
+def default_relay_dir() -> str:
+    env_dir = os.environ.get("QUINE_RELAY_DIR")
+    if env_dir:
+        return env_dir
+    container_dir = "/usr/local/share/quine-relay"
+    if os.path.isfile(os.path.join(container_dir, "LANGUAGES.md")) and os.path.isfile(
+        os.path.join(container_dir, "Makefile")
+    ):
+        return container_dir
+    return os.getcwd()
+
+
+def resolve_make_vars(makefile_path: str) -> dict[str, str]:
+    candidates = {
+        "CC": ("cc", "gcc", "clang"),
+        "CXX": ("c++", "g++", "clang++"),
+        "JAVASCRIPT": ("nodejs", "node", "js"),
+        "SCHEME": ("guile", "csi", "gosh"),
+        "GBS": ("gbs3", "gbs2", "gba3"),
+        "WASI_RUNTIME": ("wasmtime", "node"),
+    }
+    try:
+        with open(makefile_path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = re.match(r"^([A-Z_]+)\s*:=\s*\$\(call find_any,[^,]+,([^)]+)\)", line)
+                if m:
+                    var_name, choices = m.group(1), tuple(m.group(2).split())
+                    candidates[var_name] = choices
+    except OSError:
+        pass
+
+    resolved: dict[str, str] = {}
+    for var_name, choices in candidates.items():
+        found = next((c for c in choices if shutil.which(c)), None)
+        resolved[var_name] = found or choices[0]
+    return resolved
+
+
+def parse_languages_md(path: str) -> dict[int, dict[str, str]]:
+    rows: dict[int, dict[str, str]] = {}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            m = LANG_ROW_RE.match(line.strip())
+            if m:
+                step = int(m.group(1))
+                rows[step] = {
+                    "language": m.group(2),
+                    "origin": m.group(3),
+                    "note": m.group(4),
+                }
+    return rows
+
+
+def parse_makefile_rules(path: str) -> list[dict]:
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().splitlines()
+
+    rules: list[dict] = []
+    i = 0
+    while i < len(lines):
+        m = RULE_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        out_file, in_file = m.group(1), m.group(2)
+        cmds: list[str] = []
+        banner: tuple[int, str, str] | None = None
+        i += 1
+        while i < len(lines) and (lines[i].startswith("\t") or lines[i] == ""):
+            ln = lines[i]
+            if ln.startswith("\t"):
+                bm = BANNER_RE.search(ln)
+                if bm:
+                    banner = (int(bm.group(1)), bm.group(2), bm.group(3))
+                elif not ln.startswith("\t@"):
+                    cmds.append(ln.strip())
+            elif ln == "":
+                if i + 1 < len(lines) and not lines[i + 1].startswith("\t"):
+                    break
+            i += 1
+
+        step_num = banner[0] if banner else len(rules) + 1
+        lang = banner[1] if banner else ""
+        next_lang = banner[2] if banner else ""
+        rules.append(
+            {
+                "step": step_num,
+                "language": lang,
+                "next_language": next_lang,
+                "source_file": in_file,
+                "target_file": out_file,
+                "raw_cmds": cmds,
+            }
+        )
+    return rules
+
+
+def split_shell_segments(cmd_line: str) -> list[str]:
+    text = cmd_line.strip()
+    if text.endswith("|| true"):
+        text = text[: -len("|| true")].strip()
+    # Unwrap subshell wrapper like "(cd qrgleam; gleam run ...) > QR.glu"
+    sub_m = re.match(r"^\(([^)]+)\)(?:\s*[<>].*)?$", text)
+    if sub_m:
+        text = sub_m.group(1).strip()
+
+    segments: list[str] = []
+    for part in re.split(r"\s*(?:&&|;)\s*", text):
+        part = part.strip()
+        if part:
+            segments.append(part)
+    return segments
+
+
+def strip_redirections(tokens: list[str]) -> list[str]:
+    clean: list[str] = []
+    skip_next = False
+    for tok in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in (">", "<", ">>", "2>", "1>", "&>"):
+            skip_next = True
+            continue
+        if re.match(r"^(?:[012]?>|<).*$", tok):
+            continue
+        clean.append(tok)
+    return clean
+
+
+def expand_vars(cmd: str, vars_map: dict[str, str]) -> str:
+    def repl(match: re.Match[str]) -> str:
+        name = match.group(1)
+        return vars_map.get(name, match.group(0))
+
+    return re.sub(r"\$\(([A-Z_]+)\)", repl, cmd)
+
+
+def extract_tools(raw_cmds: list[str], vars_map: dict[str, str], relay_dir: str) -> list[dict[str, str]]:
+    tools: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_tool(kind: str, target: str) -> None:
+        key = (kind, target)
+        if key not in seen:
+            seen.add(key)
+            tools.append({"kind": kind, "target": target})
+
+    for raw in raw_cmds:
+        expanded = expand_vars(raw, vars_map)
+        for seg in split_shell_segments(expanded):
+            try:
+                toks = shlex.split(seg)
+            except ValueError:
+                toks = seg.split()
+            toks = strip_redirections(toks)
+            while toks:
+                em = ENV_ASSIGN_RE.match(toks[0])
+                if not em:
+                    break
+                env_val = em.group(2)
+                if env_val.startswith("vendor/") or env_val.startswith("/opt/"):
+                    add_tool("path", env_val)
+                toks.pop(0)
+            if not toks:
+                continue
+            exe = toks[0]
+            if exe in SHELL_SKIP_CMDS or LOCAL_BIN_RE.match(exe):
+                continue
+            add_tool("bin", exe)
+
+            if exe == "node" and "vendor/wasi-runtime.js" in seg:
+                add_tool("path", "vendor/wasi-runtime.js")
+
+            for arg in toks[1:]:
+                if "*" in arg:
+                    continue
+                if arg.startswith("vendor/") and (
+                    arg.endswith((".rb", ".js", ".exe")) or "/local/" in arg
+                ):
+                    add_tool("path", arg)
+                elif arg.startswith(("/opt/", "/usr/share/java/", "/usr/local/lib/")) and arg.endswith(
+                    (".jar", ".py", ".rb")
+                ):
+                    add_tool("path", arg)
+                elif ":" in arg and (".jar" in arg or "/opt/" in arg):
+                    for cp_entry in arg.split(":"):
+                        if cp_entry.startswith("/") and cp_entry.endswith(".jar"):
+                            add_tool("path", cp_entry)
+                        elif cp_entry.startswith("std:/"):
+                            add_tool("path", cp_entry[4:])
+
+    # Normalize relative helper paths against relay_dir when checking
+    for t in tools:
+        if t["kind"] == "path" and not t["target"].startswith("/"):
+            t["resolved_path"] = os.path.join(relay_dir, t["target"])
+        else:
+            t["resolved_path"] = t["target"]
+    return tools
+
+
+def check_tool(tool: dict[str, str]) -> tuple[bool, str]:
+    if tool["kind"] == "bin":
+        target = tool["target"]
+        if "/" in target:
+            ok = os.path.isfile(target) and os.access(target, os.X_OK)
+            return ok, target if ok else f"missing executable {target}"
+        found = shutil.which(target)
+        return bool(found), found or f"missing on PATH: {target}"
+    path = tool["resolved_path"]
+    ok = os.path.exists(path)
+    return ok, path if ok else f"missing helper path: {path}"
+
+
+def load_entries(relay_dir: str, languages_md: str | None, makefile: str | None) -> list[dict]:
+    lang_path = languages_md or os.path.join(relay_dir, "LANGUAGES.md")
+    mk_path = makefile or os.path.join(relay_dir, "Makefile")
+
+    if not os.path.isfile(lang_path):
+        raise FileNotFoundError(f"LANGUAGES.md not found: {lang_path}")
+    if not os.path.isfile(mk_path):
+        raise FileNotFoundError(f"Makefile not found: {mk_path}")
+
+    lang_meta = parse_languages_md(lang_path)
+    rules = parse_makefile_rules(mk_path)
+    vars_map = resolve_make_vars(mk_path)
+
+    entries: list[dict] = []
+    for r in rules:
+        step = r["step"]
+        meta = lang_meta.get(step, {})
+        language = meta.get("language") or r["language"]
+        src = r["source_file"]
+        base = os.path.basename(src)
+        ext = base[base.find(".") :] if "." in base else ""
+        cmd_str = " && ".join(r["raw_cmds"])
+        resolved_cmd = expand_vars(cmd_str, vars_map)
+        tools = extract_tools(r["raw_cmds"], vars_map, relay_dir)
+        entries.append(
+            {
+                "step": step,
+                "language": language,
+                "next_language": r["next_language"],
+                "origin": meta.get("origin", ""),
+                "note": meta.get("note", ""),
+                "source_file": src,
+                "target_file": r["target_file"],
+                "extension": ext,
+                "command": cmd_str,
+                "resolved_command": resolved_cmd,
+                "tools": tools,
+            }
+        )
+    return entries
+
+
+def filter_entries(entries: list[dict], query: str | None) -> list[dict]:
+    if not query:
+        return entries
+    q = query.lower()
+    out: list[dict] = []
+    for e in entries:
+        haystack = " ".join(
+            [
+                str(e["step"]),
+                e["language"],
+                e["next_language"],
+                e["extension"],
+                e["source_file"],
+                e["origin"],
+                e["note"],
+                e["command"],
+                e["resolved_command"],
+            ]
+        ).lower()
+        if q in haystack:
+            out.append(e)
+    return out
+
+
+def format_table(entries: list[dict]) -> str:
+    lines = [
+        f"{'#':>3}  {'Language':<28} {'Ext':<12} {'Origin':<16} Command",
+        f"{'-'*3}  {'-'*28} {'-'*12} {'-'*16} {'-'*40}",
+    ]
+    for e in entries:
+        lines.append(
+            f"{e['step']:>3}  {e['language'][:28]:<28} {e['extension'][:12]:<12} "
+            f"{e['origin'][:16]:<16} {e['resolved_command']}"
+        )
+    return "\n".join(lines)
+
+
+def run_check(entries: list[dict], relay_dir: str, as_json: bool) -> int:
+    results = []
+    ok_steps = 0
+    missing_steps = 0
+    for e in entries:
+        tool_checks = []
+        step_ok = bool(e["tools"])
+        for t in e["tools"]:
+            ok, detail = check_tool(t)
+            if not ok:
+                step_ok = False
+            tool_checks.append(
+                {
+                    "kind": t["kind"],
+                    "target": t["target"],
+                    "ok": ok,
+                    "detail": detail,
+                }
+            )
+        if step_ok:
+            ok_steps += 1
+        else:
+            missing_steps += 1
+        results.append(
+            {
+                "step": e["step"],
+                "language": e["language"],
+                "extension": e["extension"],
+                "ok": step_ok,
+                "checks": tool_checks,
+            }
+        )
+
+    if as_json:
+        payload = {
+            "relay_dir": relay_dir,
+            "total": len(entries),
+            "ok": ok_steps,
+            "missing": missing_steps,
+            "results": results,
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        for item in results:
+            if not item["ok"]:
+                bad = ", ".join(c["detail"] for c in item["checks"] if not c["ok"])
+                print(f"MISSING [{item['step']:>3}] {item['language']}: {bad}")
+        print(f"Toolchain check: {ok_steps}/{len(entries)} steps OK ({missing_steps} missing)")
+    return 0 if missing_steps == 0 else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="polyglot-info",
+        description="List, search, and verify all 256 Quine Relay 256 language toolchains.",
+    )
+    parser.add_argument("--list", action="store_true", help="List all matching languages (default)")
+    parser.add_argument("--json", action="store_true", help="Output JSON instead of a table")
+    parser.add_argument("--search", metavar="QUERY", help="Case-insensitive filter over language, ext, origin, or command")
+    parser.add_argument("--check", action="store_true", help="Verify compiler/interpreter availability for matching steps")
+    parser.add_argument(
+        "--relay-dir",
+        default=default_relay_dir(),
+        help="Path containing LANGUAGES.md and Makefile (default: $QUINE_RELAY_DIR or /usr/local/share/quine-relay)",
+    )
+    parser.add_argument("--languages-md", help="Explicit path to LANGUAGES.md")
+    parser.add_argument("--makefile", help="Explicit path to Makefile")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    args = parser.parse_args(argv)
+
+    try:
+        entries = load_entries(args.relay_dir, args.languages_md, args.makefile)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    matched = filter_entries(entries, args.search)
+
+    if args.check:
+        return run_check(matched, args.relay_dir, args.json)
+
+    if args.json:
+        slim = [
+            {
+                "step": e["step"],
+                "language": e["language"],
+                "next_language": e["next_language"],
+                "extension": e["extension"],
+                "source_file": e["source_file"],
+                "target_file": e["target_file"],
+                "origin": e["origin"],
+                "note": e["note"],
+                "command": e["command"],
+                "resolved_command": e["resolved_command"],
+            }
+            for e in matched
+        ]
+        print(json.dumps(slim, indent=2))
+        return 0
+
+    print(format_table(matched))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

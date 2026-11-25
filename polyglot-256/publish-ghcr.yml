@@ -1,0 +1,85 @@
+name: Publish Polyglot-256 GHCR Image
+
+# Builds and publishes ghcr.io/<owner>/polyglot-256 (~32.5 GB) from an
+# existing quine-relay-256 base image (or builds the base image first if absent).
+# Exceeds standard GitHub-hosted runner disk limits; run manually on a
+# self-hosted Linux x86_64 runner with >= 45 GB free disk.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: "Existing Docker base image tag to layer polyglot-256 on"
+        required: true
+        default: "quine-relay-256:latest"
+        type: string
+      image_tag:
+        description: "Destination image tag under ghcr.io/<owner>/polyglot-256"
+        required: true
+        default: "latest"
+        type: string
+      build_base_if_missing:
+        description: "Build base_image from repository Dockerfile if not present locally"
+        required: true
+        default: false
+        type: boolean
+      push_image:
+        description: "Push built image to GHCR"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: self-hosted
+    steps:
+      - name: Verify Linux x86_64 runner
+        run: |
+          test "$(uname -s)-$(uname -m)" = "Linux-x86_64"
+
+      - uses: actions/checkout@v4
+
+      - name: Ensure base image exists
+        run: |
+          if ! docker image inspect "${{ inputs.base_image }}" >/dev/null 2>&1; then
+            if [ "${{ inputs.build_base_if_missing }}" = "true" ]; then
+              docker build --pull -t "${{ inputs.base_image }}" .
+            else
+              echo "Base image '${{ inputs.base_image }}' not found and build_base_if_missing is false." >&2
+              exit 1
+            fi
+          fi
+
+      - name: Log in to GitHub Container Registry
+        if: inputs.push_image
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build polyglot-256 image
+        env:
+          OWNER_LOWER: ${{ github.repository_owner }}
+        run: |
+          IMAGE="ghcr.io/$(printf '%s' "$OWNER_LOWER" | tr '[:upper:]' '[:lower:]')/polyglot-256:${{ inputs.image_tag }}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          docker build \
+            --build-arg BASE_IMAGE="${{ inputs.base_image }}" \
+            -f polyglot-256/Dockerfile.polyglot \
+            -t "$IMAGE" \
+            polyglot-256
+
+      - name: Verify 256 toolchains inside container
+        run: |
+          docker run --rm "$IMAGE" polyglot-info --check
+          docker run --rm "$IMAGE" polyglot-info --search Malbolge
+
+      - name: Push image to GHCR
+        if: inputs.push_image
+        run: |
+          docker push "$IMAGE"
